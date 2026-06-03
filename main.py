@@ -1,148 +1,145 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
-from pydantic import BaseModel
-from typing import Optional
 import hashlib
 import re
-import os
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
+from mangum import Mangum
 
-app = FastAPI(title="Password Strength Analyzer", version="1.0.0")
+app = FastAPI(
+    title="Password Strength API",
+    description="Check password security and get actionable recommendations",
+    version="1.0.0"
+)
 
-# Rate limiting (simple in-memory)
-from datetime import datetime, timedelta
-rate_limits = {}
+# API Key auth
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
 
-def rate_limit(request: Request):
-    api_key = request.headers.get("X-API-Key", "anonymous")
-    now = datetime.now()
+def get_api_key(key: str = Security(API_KEY_HEADER)):
+    if not key:
+        raise HTTPException(status_code=401, detail="API key required")
+    return key
+
+# In-memory rate limiting
+rate_limit_store = {}
+
+def rate_limit(api_key: str = Depends(get_api_key)):
+    import time
+    key = f"rate_{api_key}"
+    current_time = int(time.time())
+    minute_ago = current_time - 60
     
-    key = f"{api_key}:{now.strftime('%Y-%m-%d-%H')}"
-    if key not in rate_limits:
-        rate_limits[key] = 0
-    rate_limits[key] += 1
+    if key not in rate_limit_store:
+        rate_limit_store[key] = []
     
-    if rate_limits[key] > 1000:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    return
+    rate_limit_store[key] = [t for t in rate_limit_store[key] if t > minute_ago]
+    
+    if len(rate_limit_store[key]) >= 100:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded (100/min)")
+    
+    rate_limit_store[key].append(current_time)
+    return api_key
 
-class PasswordRequest(BaseModel):
+# Common weak passwords
+COMMON_PASSWORDS = {
+    "123456", "password", "123456789", "12345678", "12345",
+    "1234567", "1234567890", "qwerty", "abc123", "password1",
+    "password123", "admin", "letmein", "welcome", "monkey",
+    "dragon", "master", "login", "princess", "football",
+    "iloveyou", "trustno1", "shadow", "sunshine", "ashley",
+    "bailey", "passw0rd", "baseball", "tigger", "hunter"
+}
+
+class PasswordCheck(BaseModel):
     password: str
 
-class StrengthResult(BaseModel):
+class PasswordResponse(BaseModel):
     score: int
-    verdict: str
-    entropy: float
+    strength: str
     length: int
     has_uppercase: bool
     has_lowercase: bool
     has_digits: bool
     has_special: bool
-    suggestions: list
-
-class BreachCheckRequest(BaseModel):
-    password: str
-
-class BreachResult(BaseModel):
-    breached: bool
-    message: str
-
-def calculate_entropy(password: str) -> float:
-    charset_size = 0
-    if re.search(r'[a-z]', password):
-        charset_size += 26
-    if re.search(r'[A-Z]', password):
-        charset_size += 26
-    if re.search(r'[0-9]', password):
-        charset_size += 10
-    if re.search(r'[^a-zA-Z0-9]', password):
-        charset_size += 32
-    
-    if charset_size == 0:
-        return 0
-    return len(password) * (charset_size.bit_length() - 1)
-
-def get_strength_verdict(score: int) -> str:
-    if score < 3:
-        return "Very Weak"
-    elif score < 5:
-        return "Weak"
-    elif score < 7:
-        return "Moderate"
-    elif score < 9:
-        return "Strong"
-    else:
-        return "Very Strong"
-
-def generate_suggestions(password: str, score: int) -> list:
-    suggestions = []
-    if len(password) < 12:
-        suggestions.append("Use at least 12 characters")
-    if not re.search(r'[A-Z]', password):
-        suggestions.append("Add uppercase letters")
-    if not re.search(r'[a-z]', password):
-        suggestions.append("Add lowercase letters")
-    if not re.search(r'[0-9]', password):
-        suggestions.append("Add numbers")
-    if not re.search(r'[^a-zA-Z0-9]', password):
-        suggestions.append("Add special characters (!@#$%^&* etc)")
-    if score < 7:
-        suggestions.append("Avoid common patterns like 'password123'")
-    return suggestions
+    has_common_pattern: bool
+    is_common_password: bool
+    entropy_bits: int
+    recommendations: list[str]
 
 @app.get("/health")
-async def health():
-    return {"status": "healthy"}
+def health():
+    return {"status": "ok", "service": "password-strength-api"}
 
-@app.post("/analyze")
-async def analyze_password(request: PasswordRequest, _: None = Depends(rate_limit)):
-    if not request.password:
-        raise HTTPException(status_code=400, detail="Password required")
-    
-    password = request.password
-    entropy = calculate_entropy(password)
-    
+@app.post("/check", dependencies=[Depends(rate_limit)])
+def check_password(data: PasswordCheck) -> PasswordResponse:
+    password = data.password
     length = len(password)
-    length_score = min(length // 2, 5)
-    entropy_score = min(int(entropy / 10), 5)
-    score = min((length_score + entropy_score) // 2, 10)
     
-    result = StrengthResult(
-        score=score,
-        verdict=get_strength_verdict(score),
-        entropy=round(entropy, 2),
-        length=length,
-        has_uppercase=bool(re.search(r'[A-Z]', password)),
-        has_lowercase=bool(re.search(r'[a-z]', password)),
-        has_digits=bool(re.search(r'[0-9]', password)),
-        has_special=bool(re.search(r'[^a-zA-Z0-9]', password)),
-        suggestions=generate_suggestions(password, score)
+    has_upper = bool(re.search(r'[A-Z]', password))
+    has_lower = bool(re.search(r'[a-z]', password))
+    has_digit = bool(re.search(r'[0-9]', password))
+    has_special = bool(re.search(r'[!@#$%^&*()_+\-=\[\]{};:\'",.<>/?`~\\|\\]', password))
+    
+    is_common = password.lower() in {p.lower() for p in COMMON_PASSWORDS}
+    
+    patterns = [
+        (r'(\d)\1{2,}', "repeated digits"),
+        (r'([a-zA-Z])\1{2,}', "repeated letters"),
+        (r'(012|123|234|345|456|567|678|789|890|abc|bcd|cde|def|efgh)', "sequential pattern"),
+        (r'(qwerty|asdf|zxcv)', "keyboard pattern")
+    ]
+    has_pattern = any(re.search(p, password.lower()) for p, _ in patterns)
+    
+    charset_size = sum([
+        26 if has_lower else 0,
+        26 if has_upper else 0,
+        10 if has_digit else 0,
+        20 if has_special else 0
+    ])
+    entropy = int(length * (charset_size.bit_length() or 1)) if charset_size > 0 else 0
+    
+    score = 0
+    if length >= 8:
+        score += 1
+    if length >= 12:
+        score += 1
+    if has_upper and has_lower and has_digit:
+        score += 1
+    if has_special:
+        score += 1
+    
+    if is_common or has_pattern:
+        score = max(0, score - 2)
+    
+    strength_map = {0: "very_weak", 1: "weak", 2: "moderate", 3: "strong", 4: "very_strong"}
+    strength = strength_map.get(score, "weak")
+    
+    recommendations = []
+    if length < 12:
+        recommendations.append("Use at least 12 characters")
+    if not has_upper:
+        recommendations.append("Add uppercase letters")
+    if not has_lower:
+        recommendations.append("Add lowercase letters")
+    if not has_digit:
+        recommendations.append("Add numbers")
+    if not has_special:
+        recommendations.append("Add special characters (!@#$%^&*)")
+    if has_pattern:
+        recommendations.append("Avoid repeated or sequential patterns")
+    if is_common:
+        recommendations.append("This is a commonly used password - avoid it completely")
+    
+    return PasswordResponse(
+        score=score, strength=strength, length=length,
+        has_uppercase=has_upper, has_lowercase=has_lower,
+        has_digits=has_digit, has_special=has_special,
+        has_common_pattern=has_pattern, is_common_password=is_common,
+        entropy_bits=entropy, recommendations=recommendations
     )
-    return result
 
-@app.post("/check-breach")
-async def check_breach(request: BreachCheckRequest, _: None = Depends(rate_limit)):
-    password = request.password
-    sha1 = hashlib.sha1(password.encode()).hexdigest().upper()
-    prefix, suffix = sha1[:5], sha1[5:]
-    
-    try:
-        import urllib.request
-        url = f"https://api.pwnedpasswords.com/range/{prefix}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Hermes-Password-API"})
-        resp = urllib.request.urlopen(req, timeout=10)
-        hashes = resp.read().decode().split('\r\n')
-        
-        for line in hashes:
-            parts = line.split(':')
-            if parts[0] == suffix:
-                count = int(parts[1])
-                return BreachResult(breached=True, message=f"Password found in {count:,} breaches")
-        
-        return BreachResult(breached=False, message="Password not found in known breaches")
-    except Exception as e:
-        return BreachResult(breached=False, message="Could not check breaches (offline mode)")
+@app.post("/hash")
+def hash_password(data: PasswordCheck, api_key: str = Security(get_api_key)):
+    return {"hash": hashlib.sha256(data.password.encode()).hexdigest(), "algorithm": "sha256"}
 
-try:
-    from mangum import Mangum
-    handler = Mangum(app, lifespan="off")
-except ImportError:
-    pass
+# Lambda handler for Vercel
+handler = Mangum(app)
